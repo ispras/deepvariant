@@ -33,9 +33,13 @@ potential variations, and determining the mostly likely X haplotypes (where X is
 the ploidy).
 """
 
+import atexit
+import bisect
+import collections
 import csv
 import os
 import os.path
+import sys
 
 from absl import flags
 from etils import epath
@@ -238,6 +242,27 @@ _SPLIT_SKIP_READS = flags.DEFINE_bool(
 _KMER_SIZE = flags.DEFINE_integer(
     'kmer_size', 32, 'K-mer size for fast pass alinger reads index.'
 )
+# Forced realignment windows; without these flags the realigner is unchanged.
+_WS_FORCED_WINDOWS_BED = flags.DEFINE_string(
+    'ws_forced_windows_bed',
+    '',
+    'BED of intervals added to the realignment windows.',
+)
+_FORCED_DBG_MIN_BASE_QUALITY = flags.DEFINE_integer(
+    'forced_dbg_min_base_quality',
+    -1,
+    'dbg_min_base_quality in forced windows; -1 keeps --dbg_min_base_quality.',
+)
+_FORCED_DBG_MIN_EDGE_WEIGHT = flags.DEFINE_integer(
+    'forced_dbg_min_edge_weight',
+    -1,
+    'dbg_min_edge_weight in forced windows; -1 keeps --dbg_min_edge_weight.',
+)
+_FORCED_DBG_MAX_K = flags.DEFINE_integer(
+    'forced_dbg_max_k',
+    -1,
+    'dbg_max_k in forced windows; -1 keeps --dbg_max_k.',
+)
 
 # Margin added to the reference sequence for the aligner module.
 _REF_ALIGN_MARGIN = 20
@@ -267,6 +292,178 @@ _MIN_SPLIT_LEN = 15
 
 # Minimum number of supporting reads to retain an allele for window selection.
 _MIN_ALLELE_SUPPORT = 2
+
+# Per-process counters, printed to stderr at exit when a forced BED is set.
+_DVF_STATS_KEYS = (
+    'regions',  # realign_reads calls with reads
+    'forced_regions',  # ... of them with >= 1 forced interval in the envelope
+    'forced_windows',  # final windows intersecting a forced interval
+    'merged_with_native',  # forced+native clusters merged into one window
+    'dropped_or_split_too_long',  # clusters > ws_max_window_size (split)
+    'relaxed_graphs',  # graphs built with the relaxed (forced_dbg_*) config
+    'relaxed_alt',  # ... of them with > 1 candidate haplotype
+)
+DVF_STATS = collections.OrderedDict((k, 0) for k in _DVF_STATS_KEYS)
+_DVF_FORCED = {}  # path -> {chrom: (starts, ends)}; loaded lazily once
+
+
+def _dvf_bed_path():
+  """--ws_forced_windows_bed, or '' if unset / flags not parsed."""
+  if not flags.FLAGS.is_parsed():
+    return ''
+  return _WS_FORCED_WINDOWS_BED.value or ''
+
+
+def _dvf_load_bed(path):
+  """Loads BED: per chrom sorted, overlapping/adjacent intervals merged."""
+  per = collections.defaultdict(list)
+  with epath.Path(path).open() as f:
+    for line in f:
+      if not line.strip() or line.startswith(('#', 'track', 'browser')):
+        continue
+      fields = line.rstrip('\n').split('\t')
+      start, end = int(fields[1]), int(fields[2])
+      if end > start:
+        per[fields[0]].append((start, end))
+  out = {}
+  for chrom, ivs in per.items():
+    ivs.sort()
+    merged = [list(ivs[0])]
+    for s, e in ivs[1:]:
+      if s <= merged[-1][1]:
+        merged[-1][1] = max(merged[-1][1], e)
+      else:
+        merged.append([s, e])
+    out[chrom] = ([m[0] for m in merged], [m[1] for m in merged])
+  return out
+
+
+def dvf_forced_intervals(chrom, start, end):
+  """Forced intervals (merged, sorted) intersecting [start, end) of chrom."""
+  path = _dvf_bed_path()
+  if path not in _DVF_FORCED:
+    _DVF_FORCED[path] = _dvf_load_bed(path)
+  per = _DVF_FORCED[path].get(chrom)
+  if per is None:
+    return []
+  starts, ends = per
+  res = []
+  i = bisect.bisect_right(ends, start)  # first interval with end > start
+  while i < len(starts) and starts[i] < end:
+    res.append((starts[i], ends[i]))
+    i += 1
+  return res
+
+
+def dvf_merge_windows(native, forced, max_window_size):
+  """Merges native windows with forced intervals.
+
+  A cluster longer than max_window_size keeps its native windows; its forced
+  parts outside them become separate windows, and those longer than the limit
+  are dropped.
+  """
+  items = sorted(
+      [(s, e, 0, i) for i, (s, e) in enumerate(native)]
+      + [(s, e, 1, None) for s, e in forced],
+      key=lambda x: (x[0], x[1], x[2]),
+  )
+  clusters = []
+  for it in items:
+    if clusters and it[0] <= clusters[-1][1]:
+      clusters[-1][1] = max(clusters[-1][1], it[1])
+      clusters[-1][2].append(it)
+    else:
+      clusters.append([it[0], it[1], [it]])
+  out = []
+  n_merged = n_too_long = 0
+  for cs, ce, its in clusters:
+    nat = [x for x in its if x[2] == 0]
+    frc = [x for x in its if x[2] == 1]
+    if not frc:
+      out.extend((x[0], x[1], x[3], False) for x in nat)
+    elif ce - cs <= max_window_size:
+      out.append((cs, ce, nat[0][3] if len(nat) == 1 and
+                  (nat[0][0], nat[0][1]) == (cs, ce) else None, True))
+      n_merged += 1 if nat else 0
+    else:
+      n_too_long += 1
+      for x in nat:
+        hit = any(f[0] < x[1] and x[0] < f[1] for f in frc)
+        out.append((x[0], x[1], x[3], hit))
+      for fs, fe, _, _ in frc:
+        pos = fs
+        for ns, ne, _, _ in sorted(nat):
+          if ne <= pos or ns >= fe:
+            continue
+          if ns > pos:
+            out.append((pos, ns, None, True))
+          pos = max(pos, ne)
+        if pos < fe:
+          out.append((pos, fe, None, True))
+  out = [o for o in out if o[2] is not None or o[1] - o[0] <= max_window_size]
+  out.sort(key=lambda x: (x[0], x[1]))
+  return ([(s, e, i) for s, e, i, _ in out], [o[3] for o in out], n_merged,
+          n_too_long)
+
+
+def dvf_force_windows(ws_config, ref_reader, windows, region):
+  """Adds forced intervals near the region to its native windows.
+
+  Intervals are clipped only to the contig, not to the region. Returns
+  (windows, is_forced), or (windows, None) when no interval is near.
+  """
+  chrom = region.reference_name
+  env = ws_config.region_expansion_in_bp + ws_config.min_windows_distance
+  forced = dvf_forced_intervals(chrom, region.start - env, region.end + env)
+  if not forced:
+    return windows, None
+  n_bases = ref_reader.contig(chrom).n_bases
+  forced = [(max(0, s), min(n_bases, e)) for s, e in forced]
+  forced = [(s, e) for s, e in forced if e > s]
+  if not forced:
+    return windows, None
+  DVF_STATS['forced_regions'] += 1
+  merged, is_forced, n_merged, n_too_long = dvf_merge_windows(
+      [(w.start, w.end) for w in windows], forced, ws_config.max_window_size
+  )
+  DVF_STATS['merged_with_native'] += n_merged
+  DVF_STATS['dropped_or_split_too_long'] += n_too_long
+  DVF_STATS['forced_windows'] += sum(is_forced)
+  out = [
+      windows[i] if i is not None else ranges.make_range(chrom, s, e)
+      for s, e, i in merged
+  ]
+  return out, is_forced
+
+
+def dvf_relaxed_dbg_config(dbg_config):
+  """Copy of dbg_config with --forced_dbg_* overrides; None if none set."""
+  over = {}
+  if _FORCED_DBG_MIN_BASE_QUALITY.value >= 0:
+    over['min_base_quality'] = _FORCED_DBG_MIN_BASE_QUALITY.value
+  if _FORCED_DBG_MIN_EDGE_WEIGHT.value >= 0:
+    over['min_edge_weight'] = _FORCED_DBG_MIN_EDGE_WEIGHT.value
+  if _FORCED_DBG_MAX_K.value >= 0:
+    over['max_k'] = _FORCED_DBG_MAX_K.value
+  if not over:
+    return None
+  cfg = realigner_pb2.DeBruijnGraphOptions()
+  cfg.CopyFrom(dbg_config)
+  for k, v in over.items():
+    setattr(cfg, k, v)
+  return cfg
+
+
+def _dvf_print_stats():
+  if _dvf_bed_path():
+    sys.stderr.write(
+        'DVF-STATS pid=%d %s\n'
+        % (os.getpid(), ' '.join('%s=%d' % kv for kv in DVF_STATS.items()))
+    )
+    sys.stderr.flush()
+
+
+atexit.register(_dvf_print_stats)
 
 # ---------------------------------------------------------------------------
 # Set configuration settings.
@@ -703,28 +900,38 @@ class Realigner(object):
     self.diagnostic_logger = DiagnosticLogger(self.config.diagnostics)
     self.shared_header = shared_header
 
-  def call_debruijn_graph(self, windows, reads):
-    """Helper function to call debruijn_graph module."""
+  def call_debruijn_graph(self, windows, reads, dbg_configs=None):
+    """Helper function to call debruijn_graph module.
+
+    dbg_configs, if given, overrides the graph config per window.
+    """
     windows_haplotypes = []
     # Build and process de-Bruijn graph for each window.
     sam_reader = sam.InMemorySamReader(reads)
 
-    for window in windows:
+    for window_i, window in enumerate(windows):
       if window.end - window.start > self.config.ws_config.max_window_size:
         continue
       if not self.ref_reader.is_valid(window):
         continue
       ref = self.ref_reader.query(window)
       window_reads = list(sam_reader.query(window))
+      dbg_config = self.config.dbg_config
+      relaxed = dbg_configs is not None and dbg_configs[window_i] is not None
+      if relaxed:
+        dbg_config = dbg_configs[window_i]
 
       with timer.Timer() as t:
-        graph = debruijn_graph.build(ref, window_reads, self.config.dbg_config)
+        graph = debruijn_graph.build(ref, window_reads, dbg_config)
       graph_building_time = t.GetDuration()
 
       if not graph:
         candidate_haplotypes = [ref]
       else:
         candidate_haplotypes = graph.candidate_haplotypes()
+      if relaxed and graph:
+        DVF_STATS['relaxed_graphs'] += 1
+        DVF_STATS['relaxed_alt'] += 1 if len(candidate_haplotypes) > 1 else 0
       if candidate_haplotypes and candidate_haplotypes != [ref]:
         candidate_haplotypes_info = realigner_pb2.CandidateHaplotypes(
             span=window, haplotypes=candidate_haplotypes
@@ -829,8 +1036,25 @@ class Realigner(object):
         self.config.ws_config, self.ref_reader, reads, region
     )
 
+    # Forced windows; no-op without --ws_forced_windows_bed.
+    dbg_configs = None
+    if _dvf_bed_path():
+      DVF_STATS['regions'] += 1
+      candidate_windows, is_forced = dvf_force_windows(
+          self.config.ws_config, self.ref_reader, candidate_windows, region
+      )
+      relaxed_config = (
+          dvf_relaxed_dbg_config(self.config.dbg_config)
+          if is_forced
+          else None
+      )
+      if relaxed_config is not None:
+        dbg_configs = [relaxed_config if f else None for f in is_forced]
+
     # Assemble each of those regions.
-    candidate_haplotypes = self.call_debruijn_graph(candidate_windows, reads)
+    candidate_haplotypes = self.call_debruijn_graph(
+        candidate_windows, reads, dbg_configs
+    )
     # Create our simple container to store candidate / read mappings.
     assembled_regions = [AssemblyRegion(ch) for ch in candidate_haplotypes]
 

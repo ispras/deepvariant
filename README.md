@@ -1,3 +1,26 @@
+# DeepVariant with forced realignment windows (this fork)
+
+`make_examples` can additionally run local assembly in windows given by a BED,
+with their own graph settings: `--ws_forced_windows_bed`,
+`--forced_dbg_min_base_quality`, `--forced_dbg_min_edge_weight`,
+`--forced_dbg_max_k`. Without the BED it behaves as the original 1.10.0.
+
+Where the added code is:
+
+- `deepvariant/realigner/realigner.py`: the flags and the forced windows (the only changed source file).
+- `docker/forced_windows/Dockerfile`, `patch_make_examples.py`: image that replaces
+  this file inside `make_examples.zip` of `google/deepvariant:1.10.0`.
+
+```bash
+docker build -f docker/forced_windows/Dockerfile -t deepvariant-forced-windows:1.10.0 .
+```
+
+Prebuilt image: [`egorguga/deepvariant-forced-windows:1.10.0`](https://hub.docker.com/r/egorguga/deepvariant-forced-windows).
+
+---
+
+# Original DeepVariant README (1.10.0, unchanged)
+
 <img src="docs/images/dv_logo.png" width=50% height=50%>
 
 [![release](https://img.shields.io/badge/release-v1.10-green?logo=github)](https://github.com/google/deepvariant/releases)
